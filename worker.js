@@ -230,21 +230,22 @@ async function handleSiteRequest(request, url) {
   }
 
   // HTML: transform using HTMLRewriter
+  const documentBase = fetched.url || originUrl;
   const rewriter = new HTMLRewriter()
-    .on('a', new AttrRewriter('href'))
-    .on('link', new AttrRewriter('href'))
-    .on('script', new AttrRewriter('src'))
-    .on('img', new AttrRewriter('src'))
-    .on('img', new AttrRewriter('srcset'))
-    .on('img', new AttrRewriter('data-src'))
-    .on('img', new AttrRewriter('data-srcset'))
-    .on('source', new AttrRewriter('src'))
-    .on('source', new AttrRewriter('srcset'))
-    .on('video', new AttrRewriter('src'))
-    .on('video', new AttrRewriter('poster'))
-    .on('audio', new AttrRewriter('src'))
-    .on('form', new AttrRewriter('action'))
-    .on('*', new StyleAttrRewriter());
+    .on('a', new AttrRewriter('href', documentBase))
+    .on('link', new AttrRewriter('href', documentBase))
+    .on('script', new AttrRewriter('src', documentBase))
+    .on('img', new AttrRewriter('src', documentBase))
+    .on('img', new AttrRewriter('srcset', documentBase))
+    .on('img', new AttrRewriter('data-src', documentBase))
+    .on('img', new AttrRewriter('data-srcset', documentBase))
+    .on('source', new AttrRewriter('src', documentBase))
+    .on('source', new AttrRewriter('srcset', documentBase))
+    .on('video', new AttrRewriter('src', documentBase))
+    .on('video', new AttrRewriter('poster', documentBase))
+    .on('audio', new AttrRewriter('src', documentBase))
+    .on('form', new AttrRewriter('action', documentBase))
+    .on('*', new StyleAttrRewriter(documentBase));
 
   const transformed = rewriter.transform(fetched);
 
@@ -319,7 +320,10 @@ function isLikelyAsset(pathname) {
 
 // AttrRewriter: 处理 href/src/action 等单 URL 属性，并处理 srcset 的描述符
 class AttrRewriter {
-  constructor(attrName) { this.attrName = attrName; }
+  constructor(attrName, documentBase) {
+    this.attrName = attrName;
+    this.documentBase = documentBase;
+  }
   element(el) {
     try {
       const raw = el.getAttribute(this.attrName);
@@ -334,7 +338,7 @@ class AttrRewriter {
           if (!m) return part;
           const urlPart = m[1];
           const desc = m[2] || '';
-          const newUrl = makeProxyUrl(urlPart);
+          const newUrl = makeProxyUrl(urlPart, this.documentBase);
           return `${newUrl}${desc}`;
         });
         el.setAttribute(this.attrName, mapped.join(', '));
@@ -342,7 +346,7 @@ class AttrRewriter {
       }
 
       // 普通属性：单 url
-      const newVal = makeProxyUrl(raw);
+      const newVal = makeProxyUrl(raw, this.documentBase);
       if (newVal && newVal !== raw) el.setAttribute(this.attrName, newVal);
     } catch (e) {
       // ignore per-element errors
@@ -352,13 +356,14 @@ class AttrRewriter {
 
 // StyleAttrRewriter: 处理内联 style 中的 url(...)
 class StyleAttrRewriter {
+  constructor(documentBase) { this.documentBase = documentBase; }
   element(el) {
     try {
       const styleVal = el.getAttribute('style');
       if (!styleVal) return;
       const newStyle = styleVal.replace(/url\(\s*(['"]?)(.*?)\1\s*\)/g, (m, q, u) => {
         if (/^(data:|blob:|about:|#)/i.test(u)) return `url(${q}${u}${q})`;
-        const newUrl = makeProxyUrl(u);
+        const newUrl = makeProxyUrl(u, this.documentBase);
         return `url(${q}${newUrl}${q})`;
       });
       if (newStyle !== styleVal) el.setAttribute('style', newStyle);
@@ -388,14 +393,15 @@ function isAlreadyProxied(val) {
  *  - 对 wikipedia.org / wikimedia.org 主机改写
  *  - 对相对路径（解析成 DEFAULT_ORIGIN）也会改写成 /__proxy__/zh.wikipedia.org/...
  */
-function makeProxyUrl(orig) {
+function makeProxyUrl(orig, documentBase = `https://${DEFAULT_ORIGIN}/`) {
   try {
-    const base = `https://${DEFAULT_ORIGIN}`;
-    const u = new URL(orig, base); // supports relative and protocol-relative URLs
+    if (/^\s*#/.test(orig)) return orig;
+
+    const u = new URL(orig, documentBase); // supports relative and protocol-relative URLs
     const host = u.hostname.toLowerCase();
     if (host.endsWith('.wikipedia.org') || host.endsWith('.wikimedia.org') || host === DEFAULT_ORIGIN) {
       // safe path join (u.pathname is already percent-encoded by URL)
-      return `https://${PROXY_HOST}${PROXY_PREFIX}${host}${u.pathname}${u.search || ''}`;
+      return `https://${PROXY_HOST}${PROXY_PREFIX}${host}${u.pathname}${u.search || ''}${u.hash || ''}`;
     }
     // keep third-party absolute URLs unchanged
     return orig;
