@@ -1,6 +1,7 @@
-﻿# 中文维基百科 Cloudflare Worker 代理
+# 中文维基百科 Cloudflare Worker 代理
 
-这是一个使用 Cloudflare Worker 代理中文维基百科的单文件项目。Worker 会将中文维基页面、维基媒体资源和页面内链接转发到代理域名，并提供独立的密钥登录页面。
+这是一个使用 Cloudflare Worker 代理中文维基百科的单文件项目。Worker 会将中文维基页面、维基媒体资源和页面内链接转发到代理域名，并提供独立的密钥登录页面。  
+复刻自[zyhgov/Wikipedia-Proxy-Gateway](https://github.com/zyhgov/Wikipedia-Proxy-Gateway)
 
 ## 功能
 
