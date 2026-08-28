@@ -10,16 +10,18 @@
  *  - 处理 Range、Referer、User-Agent，删除限制性响应头（CSP/COOP/CORP/X-Frame-Options 等）。
  *  - 当 proxied 请求失败时，尝试回退到直接请求上游原始 URL（作为最后手段）。
  *  - 基本方法白名单、简易本地失效缓存、友好错误页。
- *  - 【新增】HTTP Basic 认证，保护整个代理。
+ *  - 独立密钥登录页，使用签名 Cookie 保护整个代理。
  *
  * 请结合 Cloudflare 仪表盘的 DNS/Routes/Edge Certificates 配置使用（CNAME -> workers.dev，橙云开启）。
  */
 
-const PROXY_USERNAME = 'hihaaa666';        // 替换成你想要的用户名
-const PROXY_PASSWORD = 'hihaaa666';        // 替换成你想要的密码
-const PROXY_HOST = 'wiki.starpole.cc.cd';
+const PROXY_PASSWORD = '你的密码';        // 替换成你想要的密码
+const PROXY_HOST = '你自己的域名'; 
 const DEFAULT_ORIGIN = 'zh.wikipedia.org';
 const PROXY_PREFIX = '/__proxy__/';
+const LOGIN_PATH = '/__wiki_login';
+const SESSION_COOKIE = 'wiki_proxy_session';
+const SESSION_TTL = 60 * 60 * 24 * 7;
 
 // 缓存与性能调优（按需调整）
 const TTL_HTML = 60 * 15;           // HTML 缓存 15 分钟
@@ -39,38 +41,95 @@ addEventListener('fetch', event => {
   event.respondWith(mainHandler(event.request));
 });
 
-/* ========== 密码验证函数 ========== */
-function authenticate(request) {
-  const auth = request.headers.get('Authorization');
-  if (!auth || !auth.startsWith('Basic ')) {
+/* ========== 登录与会话验证 ========== */
+async function authenticate(request) {
+  const cookies = request.headers.get('Cookie') || '';
+  const match = cookies.match(new RegExp(`(?:^|;\\s*)${SESSION_COOKIE}=([^;]+)`));
+  if (!match) return false;
+
+  const token = decodeURIComponent(match[1]);
+  const parts = token.split('.');
+  if (parts.length !== 2 || !/^\d+$/.test(parts[0])) return false;
+
+  const issuedAt = Number(parts[0]);
+  if (!Number.isSafeInteger(issuedAt) || Math.floor(Date.now() / 1000) - issuedAt > SESSION_TTL) {
     return false;
   }
-  const base64 = auth.slice(6);
-  const credentials = atob(base64);
-  const [username, password] = credentials.split(':');
-  return username === PROXY_USERNAME && password === PROXY_PASSWORD;
+
+  return parts[1] === await signSession(parts[0]);
 }
 
-/* -------------------- 主入口（已加入密码验证） -------------------- */
-async function mainHandler(request) {
-  // 密码保护：所有请求都需要验证
-  if (!authenticate(request)) {
-    return new Response('Unauthorized', {
-      status: 401,
-      headers: {
-        'WWW-Authenticate': 'Basic realm="Access to Proxy"',
-        'Content-Type': 'text/plain'
-      }
-    });
+async function signSession(value) {
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(PROXY_PASSWORD),
+    { name: 'HMAC', hash: 'SHA-256' },
+    false,
+    ['sign']
+  );
+  const signature = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(value));
+  return [...new Uint8Array(signature)].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function loginPage(message = '', next = '/') {
+  const safeMessage = String(message).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const safeNext = next.startsWith('/') && !next.startsWith('//') ? next : '/';
+  const action = `${LOGIN_PATH}?next=${encodeURIComponent(safeNext)}`;
+  return new Response(`<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>访问验证</title>
+<style>
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f7fb;color:#222}
+form{box-sizing:border-box;width:min(360px,calc(100% - 32px));padding:28px;background:#fff;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.08)}
+h1{margin:0 0 20px;font-size:22px;text-align:center}label{display:block;margin-bottom:8px;font-size:14px}input{box-sizing:border-box;width:100%;padding:11px 12px;border:1px solid #ccd3dd;border-radius:6px;font-size:16px}button{width:100%;margin-top:16px;padding:11px;border:0;border-radius:6px;background:#1769aa;color:#fff;font-size:16px;cursor:pointer}.error{margin:0 0 12px;color:#c0392b;font-size:14px;text-align:center}
+</style></head><body><form method="post" action="${action}"><h1>访问验证</h1>${safeMessage ? `<p class="error">${safeMessage}</p>` : ''}<label for="key">请输入访问密钥</label><input id="key" name="key" type="password" autocomplete="current-password" required autofocus><button type="submit">进入网站</button></form></body></html>`, {
+    status: message ? 401 : 200,
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
+  });
+}
+
+async function handleLogin(request, url) {
+  if (request.method === 'GET') return loginPage();
+  if (request.method !== 'POST') return new Response('Method Not Allowed', { status: 405 });
+
+  let form;
+  try {
+    form = await request.formData();
+  } catch (e) {
+    return loginPage('请求格式无效');
   }
 
+  if (form.get('key') !== PROXY_PASSWORD) return loginPage('密钥错误，请重试');
+
+  const issuedAt = String(Math.floor(Date.now() / 1000));
+  const token = `${issuedAt}.${await signSession(issuedAt)}`;
+  const next = url.searchParams.get('next');
+  const location = next && next.startsWith('/') && !next.startsWith('//') ? next : '/';
+  return new Response(null, {
+    status: 303,
+    headers: {
+      Location: location,
+      'Set-Cookie': `${SESSION_COOKIE}=${encodeURIComponent(token)}; Max-Age=${SESSION_TTL}; Path=/; Secure; HttpOnly; SameSite=Lax`,
+      'Cache-Control': 'no-store'
+    }
+  });
+}
+
+/* -------------------- 主入口 -------------------- */
+async function mainHandler(request) {
   try {
+    const url = new URL(request.url);
+
+    if (url.pathname === LOGIN_PATH) return await handleLogin(request, url);
+
+    if (!(await authenticate(request))) {
+      return loginPage('', url.pathname + url.search);
+    }
+
     // 方法限制
     if (!ALLOWED_METHODS.has(request.method)) {
       return new Response('Method Not Allowed', { status: 405 });
     }
-
-    const url = new URL(request.url);
 
     // health check
     if (url.pathname === '/__wiki_proxy_ping') return new Response('ok', { status: 200 });
