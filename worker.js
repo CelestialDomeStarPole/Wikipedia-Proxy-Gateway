@@ -16,7 +16,7 @@
  */
 
 const PROXY_PASSWORD = '你的密码';        // 替换成你想要的密码
-const PROXY_HOST = '你自己的域名'; 
+const PROXY_HOST = '你自己的域名';        // 替换成你部署的域名（必须是 CF Worker 绑定的域名）    
 const DEFAULT_ORIGIN = 'zh.wikipedia.org';
 const PROXY_PREFIX = '/__proxy__/';
 const LOGIN_PATH = '/__wiki_login';
