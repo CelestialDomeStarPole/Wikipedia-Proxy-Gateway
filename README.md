@@ -8,9 +8,8 @@
 - 代理 `zh.wikipedia.org` 页面。
 - 重写 Wikipedia、Wikimedia 链接，使资源继续通过代理访问。
 - 支持图片、脚本、样式、视频、字体和 `srcset` 等资源。
-- 保留页面锚点，例如 `#演化史`。
 - 使用 Cloudflare Edge Cache 缓存 HTML 和静态资源。
-- 使用网页密钥登录，不调用浏览器原生账号密码弹窗。
+- 使用网页密钥登录
 
 ## 部署前准备
 
