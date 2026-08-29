@@ -285,12 +285,16 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
   const target = `https://${DEFAULT_ORIGIN}${path}`;
 
   const forwarded = new Request(target, {
-    method: 'GET',
+    method: request.method,
     headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN),
+    body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
     redirect: 'follow'
   });
 
-  const cacheKey = new Request(target, forwarded);
+  const cacheKey = new Request(target, {
+    method: request.method,
+    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN)
+  });
 
   try {
     const cached = await cache.match(cacheKey);

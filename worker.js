@@ -333,12 +333,16 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
 
   // For direct asset paths that point to non-default hosts, the HTML rewrite will create /__proxy__/host/... requests.
   const forwarded = new Request(target, {
-    method: 'GET', // cache key always GET for static cache
+    method: request.method,
     headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN),
+    body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
     redirect: 'follow'
   });
 
-  const cacheKey = new Request(target, forwarded);
+  const cacheKey = new Request(target, {
+    method: request.method,
+    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN)
+  });
 
   // try cache
   try {
