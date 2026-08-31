@@ -163,6 +163,7 @@ async function handleProxyUpstream(request, url) {
     const cache = caches.default;
     const cacheKey = new Request(target, { method: 'GET', headers: forwardedReq.headers });
     const cacheable = isCacheable(request.method, path);
+    if (!cacheable) markNoCache(forwardedReq);
 
     if (cacheable) {
       try {
@@ -242,12 +243,14 @@ async function handleSiteRequest(request, url) {
     body: isIdempotent(request.method) ? null : request.body,
     redirect: isIdempotent(request.method) ? 'follow' : 'manual'
   });
+  // 页面必须回源：只有回源才能拿到源站新下发的会话 / CSRF Cookie
+  markNoCache(forwarded);
 
   let fetched;
   try {
     // 不使用 cacheEverything：源站首次响应通常带 Set-Cookie，一旦被边缘缓存
     // 就会把同一份会话 / CSRF Cookie 下发给所有访客
-    fetched = await fetch(forwarded, { cf: { cacheTtl: TTL_HTML } });
+    fetched = await fetch(forwarded);
   } catch (err) {
     return errorPage('Failed to fetch origin HTML: ' + (err.message || String(err)));
   }
@@ -322,6 +325,8 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
     redirect: isIdempotent(request.method) ? 'follow' : 'manual'
   });
 
+  if (!cacheable) markNoCache(forwarded);
+
   const cacheKey = new Request(target, {
     method: 'GET',
     headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN, url.pathname)
@@ -370,6 +375,15 @@ function isLikelyAsset(pathname) {
 
 function isIdempotent(method) {
   return method === 'GET' || method === 'HEAD';
+}
+
+// 不进缓存的请求明确要求中间层不要返回陈旧副本
+function markNoCache(request) {
+  try {
+    request.headers.set('Cache-Control', 'no-cache');
+    request.headers.set('Pragma', 'no-cache');
+  } catch (e) { /* ignore */ }
+  return request;
 }
 
 // 只有 GET/HEAD 的静态资源才允许进缓存，接口与带 Set-Cookie 的响应一律不缓存
