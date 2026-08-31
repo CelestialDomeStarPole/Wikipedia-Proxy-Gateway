@@ -17,6 +17,11 @@ const LOGIN_PATH = '/__genebank_login';
 const SESSION_COOKIE = 'genebank_proxy_session';
 const SESSION_TTL = 60 * 60 * 24 * 7;
 
+// 页面直接依赖、但不属于 NCBI 域的第三方资源，一并走代理
+const EXTRA_PROXY_HOSTS = ['code.jquery.com'];
+// 接口路径：这些请求是动态数据，绝不能被缓存
+const API_PATH_RE = /\/api(\/|$)/i;
+
 const TTL_HTML = 60 * 15;
 const TTL_ASSET_SHORT = 60 * 60 * 12;
 const TTL_ASSET_LONG = 60 * 60 * 24 * 30;
@@ -148,23 +153,25 @@ async function handleProxyUpstream(request, url) {
 
     const forwardedReq = new Request(target, {
       method: request.method,
-      headers: prepareForwardHeaders(request.headers, hostname),
+      headers: prepareForwardHeaders(request.headers, hostname, path),
       body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
-      redirect: 'follow'
+      // GET/HEAD 之外的请求若交给 runtime 自动跟随重定向，POST 会被降级成 GET，
+      // 源站随后返回 405，前端只能拿到空结果
+      redirect: isIdempotent(request.method) ? 'follow' : 'manual'
     });
 
     const cache = caches.default;
     const cacheKey = new Request(target, { method: 'GET', headers: forwardedReq.headers });
-    const likelyAsset = isLikelyAsset(path);
+    const cacheable = isCacheable(request.method, path);
 
-    if (likelyAsset) {
+    if (cacheable) {
       try {
         const cached = await cache.match(cacheKey);
         if (cached) return cached;
       } catch (e) { /* ignore */ }
     }
 
-    const cfOptions = { cacheTtl: likelyAsset ? TTL_ASSET_LONG : TTL_ASSET_SHORT, cacheEverything: true };
+    const cfOptions = cacheable ? { cacheTtl: TTL_ASSET_LONG, cacheEverything: true } : {};
 
     let fetched;
     try {
@@ -190,11 +197,17 @@ async function handleProxyUpstream(request, url) {
       headers: cleanedHeaders
     });
 
-    if (fetched.status === 200 && likelyAsset) {
+    // 手动处理重定向，让 Location 指回代理而不是源站
+    if (isRedirectStatus(fetched.status) && resp.headers.has('location')) {
+      resp.headers.set('location', toProxyLocation(resp.headers.get('location'), target, hostname));
+    }
+
+    // 带 Set-Cookie 的响应绝不入缓存，否则源站的会话会被分发给所有访客
+    if (fetched.status === 200 && cacheable && !resp.headers.has('set-cookie')) {
       resp.headers.set('Cache-Control', `public, max-age=${TTL_ASSET_LONG}`);
       eventualCachePut(cache, cacheKey, resp.clone()).catch(()=>{});
-    } else if (fetched.status === 200) {
-      resp.headers.set('Cache-Control', `public, max-age=${TTL_ASSET_SHORT}`);
+    } else {
+      resp.headers.set('Cache-Control', 'private, no-store');
     }
 
     resp.headers.set('X-GenBank-Proxy', 'upstream');
@@ -211,41 +224,50 @@ async function handleSiteRequest(request, url) {
   const likelyAsset = isLikelyAsset(url.pathname);
 
   if (likelyAsset || !acceptsHtml) {
-    return await fetchAndCacheOrigin(request, url, { asset: true });
+    return await fetchAndCacheOrigin(request, url, { asset: likelyAsset });
   }
 
   const cacheKey = new Request(request.url, request);
-  try {
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
-  } catch (e) { /* ignore */ }
+  if (isIdempotent(request.method)) {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) return cached;
+    } catch (e) { /* ignore */ }
+  }
 
   const originUrl = `https://${DEFAULT_ORIGIN}${url.pathname}${url.search}`;
   const forwarded = new Request(originUrl, {
     method: request.method,
-    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN),
-    body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
-    redirect: 'follow'
+    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN, url.pathname),
+    body: isIdempotent(request.method) ? null : request.body,
+    redirect: isIdempotent(request.method) ? 'follow' : 'manual'
   });
 
   let fetched;
   try {
-    fetched = await fetch(forwarded, { cf: { cacheTtl: TTL_HTML, cacheEverything: true } });
+    // 不使用 cacheEverything：源站首次响应通常带 Set-Cookie，一旦被边缘缓存
+    // 就会把同一份会话 / CSRF Cookie 下发给所有访客
+    fetched = await fetch(forwarded, { cf: { cacheTtl: TTL_HTML } });
   } catch (err) {
     return errorPage('Failed to fetch origin HTML: ' + (err.message || String(err)));
   }
 
   const contentType = (fetched.headers.get('content-type') || '').toLowerCase();
   if (!contentType.includes('text/html')) {
-    return new Response(fetched.body, {
+    const passthrough = new Response(fetched.body, {
       status: fetched.status,
       statusText: fetched.statusText,
       headers: stripProblematicHeaders(fetched.headers)
     });
+    if (isRedirectStatus(fetched.status) && passthrough.headers.has('location')) {
+      passthrough.headers.set('location', toProxyLocation(passthrough.headers.get('location'), originUrl, DEFAULT_ORIGIN));
+    }
+    return passthrough;
   }
 
   const documentBase = fetched.url || originUrl;
   const rewriter = new HTMLRewriter()
+    .on('head', new HeadInjector())
     .on('a', new AttrRewriter('href', documentBase))
     .on('link', new AttrRewriter('href', documentBase))
     .on('script', new AttrRewriter('src', documentBase))
@@ -270,9 +292,16 @@ async function handleSiteRequest(request, url) {
     headers: stripProblematicHeaders(fetched.headers)
   });
 
-  if (finalResp.status === 200) {
+  if (isRedirectStatus(fetched.status) && finalResp.headers.has('location')) {
+    finalResp.headers.set('location', toProxyLocation(finalResp.headers.get('location'), originUrl, DEFAULT_ORIGIN));
+  }
+
+  // 首访响应需要把源站 Cookie 下发给浏览器，绝不能进共享缓存
+  if (finalResp.status === 200 && isIdempotent(request.method) && !finalResp.headers.has('set-cookie')) {
     finalResp.headers.set('Cache-Control', `public, max-age=${TTL_HTML}`);
     try { await cache.put(cacheKey, finalResp.clone()); } catch (e) { /* ignore */ }
+  } else {
+    finalResp.headers.set('Cache-Control', 'private, no-store');
   }
 
   finalResp.headers.set('X-GenBank-Proxy', 'html-rewritten');
@@ -283,26 +312,30 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
   const cache = caches.default;
   const path = url.pathname + url.search;
   const target = `https://${DEFAULT_ORIGIN}${path}`;
+  // 接口请求（含统计用的 POST）与带 body 的请求一律不缓存
+  const cacheable = opts.asset === true && isCacheable(request.method, url.pathname);
 
   const forwarded = new Request(target, {
     method: request.method,
-    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN),
-    body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
-    redirect: 'follow'
+    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN, url.pathname),
+    body: isIdempotent(request.method) ? null : request.body,
+    redirect: isIdempotent(request.method) ? 'follow' : 'manual'
   });
 
   const cacheKey = new Request(target, {
-    method: request.method,
-    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN)
+    method: 'GET',
+    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN, url.pathname)
   });
 
-  try {
-    const cached = await cache.match(cacheKey);
-    if (cached) return cached;
-  } catch (e) { /* ignore */ }
+  if (cacheable) {
+    try {
+      const cached = await cache.match(cacheKey);
+      if (cached) return cached;
+    } catch (e) { /* ignore */ }
+  }
 
   try {
-    const cfOptions = { cacheTtl: opts.asset ? TTL_ASSET_LONG : TTL_ASSET_SHORT, cacheEverything: true };
+    const cfOptions = cacheable ? { cacheTtl: TTL_ASSET_LONG, cacheEverything: true } : {};
     const fetched = await fetch(forwarded, { cf: cfOptions });
     const cleanedHeaders = stripProblematicHeaders(fetched.headers);
 
@@ -312,9 +345,15 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
       headers: cleanedHeaders
     });
 
-    if (fetched.status === 200) {
-      resp.headers.set('Cache-Control', `public, max-age=${cfOptions.cacheTtl}`);
+    if (isRedirectStatus(fetched.status) && resp.headers.has('location')) {
+      resp.headers.set('location', toProxyLocation(resp.headers.get('location'), target, DEFAULT_ORIGIN));
+    }
+
+    if (fetched.status === 200 && cacheable && !resp.headers.has('set-cookie')) {
+      resp.headers.set('Cache-Control', `public, max-age=${TTL_ASSET_LONG}`);
       eventualCachePut(cache, cacheKey, resp.clone()).catch(()=>{});
+    } else {
+      resp.headers.set('Cache-Control', 'private, no-store');
     }
 
     resp.headers.set('X-GenBank-Proxy', 'origin-fetch');
@@ -327,6 +366,51 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
 
 function isLikelyAsset(pathname) {
   return /\.(png|jpe?g|gif|webp|svg|ico|css|js|mjs|woff2?|ttf|otf|map|mp4|webm|ogg|mp3|wav|flac|m4a|ogv|ogm|pdf|zip|gz|tar|bz2|xz)(\?.*)?$/i.test(pathname);
+}
+
+function isIdempotent(method) {
+  return method === 'GET' || method === 'HEAD';
+}
+
+// 只有 GET/HEAD 的静态资源才允许进缓存，接口与带 Set-Cookie 的响应一律不缓存
+function isCacheable(method, pathname) {
+  return isIdempotent(method) && isLikelyAsset(pathname) && !API_PATH_RE.test(pathname);
+}
+
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+
+function isRedirectStatus(status) {
+  return REDIRECT_STATUS.has(status);
+}
+
+// 把源站给出的 Location 转回代理地址，避免浏览器直接跳转到源站
+function toProxyLocation(location, upstreamBase, upstreamHost) {
+  try {
+    const u = new URL(location, upstreamBase);
+    if (u.hostname.toLowerCase() === upstreamHost.toLowerCase()) {
+      return makeProxyUrl(u.href, upstreamBase);
+    }
+    return u.href;
+  } catch (e) {
+    return location;
+  }
+}
+
+// 页面里 ncbiBaseUrl 是硬编码的源站绝对地址，前端用它拼接搜索建议等接口。
+// 在代理域名下这些请求会变成跨域直连（被 CORS 拦截），这里在文档最前面
+// 把它改写成代理域名，使拼接出的地址仍然是同源路径。
+const BASE_URL_SHIM = `<script>(function(){try{var h=${JSON.stringify('https://' + PROXY_HOST)};` +
+  `Object.defineProperty(window,'ncbiBaseUrl',{configurable:true,get:function(){return h;},set:function(){}});` +
+  `}catch(e){}})();</script>`;
+
+class HeadInjector {
+  element(el) {
+    try {
+      el.prepend(BASE_URL_SHIM, { html: true });
+    } catch (e) {
+      // ignore
+    }
+  }
 }
 
 class AttrRewriter {
@@ -401,13 +485,20 @@ function isNcbiHost(hostname) {
   return host === DEFAULT_ORIGIN || host === 'ncbi.nlm.nih.gov' || host.endsWith('.ncbi.nlm.nih.gov');
 }
 
+// 需要走代理的主机：NCBI 自身域名，以及页面直接依赖的第三方资源域
+function shouldProxyHost(hostname) {
+  if (isNcbiHost(hostname)) return true;
+  const host = hostname.toLowerCase();
+  return EXTRA_PROXY_HOSTS.some(h => host === h || host.endsWith('.' + h));
+}
+
 function makeProxyUrl(orig, documentBase = `https://${DEFAULT_ORIGIN}/`) {
   try {
     if (/^\s*#/.test(orig)) return orig;
 
     const u = new URL(orig, documentBase);
     const host = u.hostname.toLowerCase();
-    if (isNcbiHost(host)) {
+    if (shouldProxyHost(host)) {
       return `https://${PROXY_HOST}${PROXY_PREFIX}${host}${u.pathname}${u.search || ''}${u.hash || ''}`;
     }
     return orig;
@@ -416,21 +507,69 @@ function makeProxyUrl(orig, documentBase = `https://${DEFAULT_ORIGIN}/`) {
   }
 }
 
-function prepareForwardHeaders(originalHeaders, upstreamHost) {
+const DROP_REQUEST_HEADERS = new Set([
+  'host',
+  'accept-encoding',
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'cf-connecting-ip',
+  'cf-ray',
+  'cf-visitor',
+  'cf-ipcountry',
+  'via',
+  'connection',
+  'keep-alive',
+  'transfer-encoding',
+  'upgrade',
+  // 浏览器基于代理域名生成的跨站/抓取上下文头，透传给源站会导致
+  // 源站的 CSRF / 防盗链校验把它们当成跨站请求而拒绝（POST 会返回 403）
+  'origin',
+  'referer',
+  'sec-fetch-site',
+  'sec-fetch-mode',
+  'sec-fetch-dest',
+  'sec-fetch-user'
+]);
+
+function prepareForwardHeaders(originalHeaders, upstreamHost, upstreamPath = '/') {
   const headers = new Headers();
   for (const [k, v] of originalHeaders) {
     const key = k.toLowerCase();
-    if (['x-forwarded-for','cf-connecting-ip','cf-ray','via','connection','keep-alive','transfer-encoding','upgrade'].includes(key)) continue;
-    if (key === 'host') continue;
-    if (key === 'accept-encoding') continue;
+    if (DROP_REQUEST_HEADERS.has(key)) continue;
+    if (key === 'cookie') {
+      // 代理自身的会话 Cookie 不能泄露给源站，也不该参与源站的会话校验
+      if (upstreamHost !== DEFAULT_ORIGIN) continue;
+      const filtered = filterClientCookie(v);
+      if (filtered) headers.set(k, filtered);
+      continue;
+    }
     headers.set(k, v);
   }
   headers.set('Host', upstreamHost);
-  if (!headers.has('referer') && !headers.has('referrer')) {
-    headers.set('Referer', `https://${upstreamHost}/`);
-  }
+  // 让源站认为请求来自自身站点内部：GET 页面往往能通过，而带 CSRF 校验的
+  // POST 接口会因为 Origin/Referer 不匹配被直接拒绝
+  const origin = `https://${upstreamHost}`;
+  headers.set('Origin', origin);
+  headers.set('Referer', `${origin}${upstreamPath || '/'}`);
+  headers.set('Sec-Fetch-Site', 'same-origin');
   if (!headers.has('user-agent')) headers.set('User-Agent', 'Mozilla/5.0 (compatible; genebank-proxy/1.0)');
   return headers;
+}
+
+// 从浏览器带来的 Cookie 中剔除代理自身的会话 Cookie，其余（源站下发的 Cookie）原样透传
+function filterClientCookie(cookieHeader) {
+  if (!cookieHeader) return '';
+  return cookieHeader
+    .split(';')
+    .map(part => part.trim())
+    .filter(Boolean)
+    .filter(pair => {
+      const eq = pair.indexOf('=');
+      const name = (eq === -1 ? pair : pair.slice(0, eq)).trim();
+      return name !== SESSION_COOKIE;
+    })
+    .join('; ');
 }
 
 function stripProblematicHeaders(origHeaders) {
@@ -443,7 +582,88 @@ function stripProblematicHeaders(origHeaders) {
     'cross-origin-resource-policy',
     'x-frame-options'
   ].forEach(h => headers.delete(h));
+  return rewriteResponseCookies(headers);
+}
+
+/**
+ * 把源站下发的 Set-Cookie 改写成浏览器可以在「代理域名」下保存的形式。
+ *
+ * 这是代理能否正常工作的关键：源站通常会带上 Domain=.xxx 属性，浏览器会
+ * 因为域名不匹配而直接丢弃这些 Cookie。后果是前端拿不到会话 / CSRF Cookie，
+ * 依赖它们的接口（例如 NCBI Datasets 的基因组统计 POST 接口需要 x-csrftoken）
+ * 会全部被拒绝，页面只能显示 0。
+ */
+function rewriteResponseCookies(headers) {
+  let raw = [];
+  try {
+    if (typeof headers.getAll === 'function') {
+      raw = headers.getAll('set-cookie') || [];
+    }
+  } catch (e) {
+    raw = [];
+  }
+  if (!raw.length) {
+    const single = headers.get('set-cookie');
+    raw = single ? [single] : [];
+  }
+  if (!raw.length) return headers;
+
+  headers.delete('set-cookie');
+  for (const value of raw) {
+    const rewritten = rewriteSetCookieValue(value);
+    if (rewritten) headers.append('set-cookie', rewritten);
+  }
   return headers;
+}
+
+function rewriteSetCookieValue(value) {
+  try {
+    const attrs = String(value)
+      .split(';')
+      .map(part => part.trim())
+      .filter(Boolean);
+    if (!attrs.length) return '';
+
+    const out = [];
+    let hasPath = false;
+
+    for (let i = 0; i < attrs.length; i++) {
+      let attr = attrs[i];
+      const lower = attr.toLowerCase();
+
+      // Domain 指向源站，浏览器会拒绝保存，必须去掉（去掉后落在代理域名下）
+      if (lower.startsWith('domain=')) continue;
+
+      // 统一挂到根路径，保证站点路径与 /__proxy__/ 路径下的请求都能带上
+      if (lower.startsWith('path=')) {
+        out.push('Path=/');
+        hasPath = true;
+        continue;
+      }
+
+      // 代理域名下 SameSite=None 需要 Secure 支持，改为 Lax 更稳妥
+      if (lower.startsWith('samesite=none')) {
+        out.push('SameSite=Lax');
+        continue;
+      }
+
+      // 第一段是 name=value，去掉与源站主机名绑定的 Cookie 前缀
+      if (i === 0) {
+        const eq = attr.indexOf('=');
+        if (eq > 0) {
+          const name = attr.slice(0, eq).replace(/^__Host-/i, '').replace(/^__Secure-/i, '');
+          attr = name + attr.slice(eq);
+        }
+      }
+
+      out.push(attr);
+    }
+
+    if (!hasPath) out.push('Path=/');
+    return out.join('; ');
+  } catch (e) {
+    return value;
+  }
 }
 
 async function eventualCachePut(cache, key, value) {
