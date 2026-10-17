@@ -10,8 +10,8 @@
  */
 
 
-const PROXY_PASSWORD = 'hunnu';
-const PROXY_HOST = 'ncbi.湖南师范大学.online';
+const PROXY_PASSWORD = '你的密码';
+const PROXY_HOST = '你的域名';
 const DEFAULT_ORIGIN = 'www.ncbi.nlm.nih.gov';
 // 统一用 punycode 形式拼接链接：填中文域名也能正常工作，ASCII 形式在 HTML/CSS/命令行里更稳
 const PROXY_HOST_ASCII = (() => {
