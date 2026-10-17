@@ -9,9 +9,14 @@
  *  - 保留原项目的登录页 + Cookie 登录模式
  */
 
-const PROXY_PASSWORD = '你的密码';
-const PROXY_HOST = '你的域名';
+
+const PROXY_PASSWORD = 'hunnu';
+const PROXY_HOST = 'ncbi.湖南师范大学.online';
 const DEFAULT_ORIGIN = 'www.ncbi.nlm.nih.gov';
+// 统一用 punycode 形式拼接链接：填中文域名也能正常工作，ASCII 形式在 HTML/CSS/命令行里更稳
+const PROXY_HOST_ASCII = (() => {
+  try { return new URL('https://' + PROXY_HOST).hostname; } catch (e) { return PROXY_HOST; }
+})();
 const PROXY_PREFIX = '/__proxy__/';
 const LOGIN_PATH = '/__genebank_login';
 const SESSION_COOKIE = 'genebank_proxy_session';
@@ -22,9 +27,22 @@ const EXTRA_PROXY_HOSTS = ['code.jquery.com'];
 // 接口路径：这些请求是动态数据，绝不能被缓存
 const API_PATH_RE = /\/api(\/|$)/i;
 
-const TTL_HTML = 60 * 15;
+const TTL_HTML = 60 * 60 * 12;          
 const TTL_ASSET_SHORT = 60 * 60 * 12;
 const TTL_ASSET_LONG = 60 * 60 * 24 * 30;
+const CACHE_VERSION = 'v3';               // 部署新版本时改一下：旧 HTML 边缘缓存会自动失配
+
+// ---- 资源合并 / 请求数优化 ----
+const INLINE_CSS = true;                   // 把外链样式表内联进 HTML，省掉每个 CSS 的独立请求
+const MAX_INLINE_CSS_BYTES = 400 * 1024;   // 单个 CSS 超过该体积则不内联
+const INLINE_ASSET_LIMIT = 32 * 1024;      // CSS 内引用的小字体/图标内联为 data URI（0 = 关闭）
+const INLINE_FAVICON = true;               // 站点图标内联为 data URI
+const MAX_INLINE_ASSETS_PER_PAGE = 6;      // 每页最多内联几个字体/图标（防止子请求数失控）
+const UPSTREAM_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+// 统一的边缘缓存键请求头：避免 Cookie / Accept 差异或上游 Vary 导致缓存永远不命中
+const CACHE_KEY_HEADERS = { 'Accept-Encoding': 'gzip, br' };
+
+
 const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'OPTIONS']);
 const hostFailureMap = new Map();
 const HOST_FAILURE_TTL = 60 * 60;
@@ -70,7 +88,7 @@ function loginPage(message = '', next = '/') {
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>访问验证</title>
 <style>
-body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f7fb;color:#222}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;background:#f5f7fb;color:#222}
 form{box-sizing:border-box;width:min(360px,calc(100% - 32px));padding:28px;background:#fff;border-radius:12px;box-shadow:0 8px 30px rgba(0,0,0,.08)}
 h1{margin:0 0 20px;font-size:22px;text-align:center}label{display:block;margin-bottom:8px;font-size:14px}input{box-sizing:border-box;width:100%;padding:11px 12px;border:1px solid #ccd3dd;border-radius:6px;font-size:16px}button{width:100%;margin-top:16px;padding:11px;border:0;border-radius:6px;background:#1769aa;color:#fff;font-size:16px;cursor:pointer}.error{margin:0 0 12px;color:#c0392b;font-size:14px;text-align:center}
 </style></head><body><form method="post" action="${action}"><h1>访问验证</h1>${safeMessage ? `<p class="error">${safeMessage}</p>` : ''}<label for="key">请输入访问密钥</label><input id="key" name="key" type="password" autocomplete="current-password" required autofocus><button type="submit">进入网站</button></form></body></html>`, {
@@ -109,6 +127,7 @@ async function handleLogin(request, url) {
 async function mainHandler(request) {
   try {
     const url = new URL(request.url);
+
 
     if (url.pathname === LOGIN_PATH) return await handleLogin(request, url);
 
@@ -161,7 +180,8 @@ async function handleProxyUpstream(request, url) {
     });
 
     const cache = caches.default;
-    const cacheKey = new Request(target, { method: 'GET', headers: forwardedReq.headers });
+    // 缓存键固定为一组最小请求头，避免 Cookie / Accept 差异或上游 Vary 让缓存永不命中
+    const cacheKey = new Request(target, { method: 'GET', headers: CACHE_KEY_HEADERS });
     const cacheable = isCacheable(request.method, path);
     if (!cacheable) markNoCache(forwardedReq);
 
@@ -206,7 +226,8 @@ async function handleProxyUpstream(request, url) {
     // 带 Set-Cookie 的响应绝不入缓存，否则源站的会话会被分发给所有访客
     if (fetched.status === 200 && cacheable && !resp.headers.has('set-cookie')) {
       resp.headers.set('Cache-Control', `public, max-age=${TTL_ASSET_LONG}`);
-      eventualCachePut(cache, cacheKey, resp.clone()).catch(()=>{});
+      // 去掉 Vary/Age 再写入，否则之后可能永远匹配不上
+      eventualCachePut(cache, cacheKey, makeCacheable(resp.clone(), TTL_ASSET_LONG)).catch(()=>{});
     } else {
       resp.headers.set('Cache-Control', 'private, no-store');
     }
@@ -228,7 +249,8 @@ async function handleSiteRequest(request, url) {
     return await fetchAndCacheOrigin(request, url, { asset: likelyAsset });
   }
 
-  const cacheKey = new Request(request.url, request);
+  // key 带缓存版本号：部署新版本后旧 HTML 缓存自动失配，不用等 TTL 过期
+  const cacheKey = new Request(`${request.url}${url.search ? '&' : '?'}__cv=${CACHE_VERSION}`, { method: 'GET' });
   if (isIdempotent(request.method)) {
     try {
       const cached = await cache.match(cacheKey);
@@ -269,6 +291,10 @@ async function handleSiteRequest(request, url) {
   }
 
   const documentBase = fetched.url || originUrl;
+  // 先把样式表内容合并进文档（纯文本替换，稳定且可并行 fetch），再交给 HTMLRewriter 改写 URL
+  const sourceHtml = await fetched.text();
+  const mergedHtml = await inlineStylesheets(sourceHtml, documentBase);
+
   const rewriter = new HTMLRewriter()
     .on('head', new HeadInjector())
     .on('a', new AttrRewriter('href', documentBase))
@@ -287,12 +313,16 @@ async function handleSiteRequest(request, url) {
     .on('iframe', new AttrRewriter('src', documentBase))
     .on('*', new StyleAttrRewriter(documentBase));
 
-  const transformed = rewriter.transform(fetched);
+  const transformed = rewriter.transform(new Response(mergedHtml, {
+    status: 200,
+    headers: { 'content-type': 'text/html; charset=utf-8' }
+  }));
 
   const finalResp = new Response(transformed.body, {
     status: fetched.status,
     statusText: fetched.statusText,
-    headers: stripProblematicHeaders(fetched.headers)
+    // body 已重新生成，旧编码/长度头必须去掉
+    headers: stripBodyHeaders(fetched.headers)
   });
 
   if (isRedirectStatus(fetched.status) && finalResp.headers.has('location')) {
@@ -301,8 +331,9 @@ async function handleSiteRequest(request, url) {
 
   // 首访响应需要把源站 Cookie 下发给浏览器，绝不能进共享缓存
   if (finalResp.status === 200 && isIdempotent(request.method) && !finalResp.headers.has('set-cookie')) {
+    // 浏览器与边缘统一按 TTL_HTML 缓存，尽量少回源
     finalResp.headers.set('Cache-Control', `public, max-age=${TTL_HTML}`);
-    try { await cache.put(cacheKey, finalResp.clone()); } catch (e) { /* ignore */ }
+    try { await cache.put(cacheKey, makeCacheable(finalResp.clone(), TTL_HTML)); } catch (e) { /* ignore */ }
   } else {
     finalResp.headers.set('Cache-Control', 'private, no-store');
   }
@@ -327,10 +358,8 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
 
   if (!cacheable) markNoCache(forwarded);
 
-  const cacheKey = new Request(target, {
-    method: 'GET',
-    headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN, url.pathname)
-  });
+  // 缓存键固定为一组最小请求头，避免 Cookie/Accept 差异或上游 Vary 导致永不命中
+  const cacheKey = new Request(target, { method: 'GET', headers: CACHE_KEY_HEADERS });
 
   if (cacheable) {
     try {
@@ -356,7 +385,7 @@ async function fetchAndCacheOrigin(request, url, opts = {}) {
 
     if (fetched.status === 200 && cacheable && !resp.headers.has('set-cookie')) {
       resp.headers.set('Cache-Control', `public, max-age=${TTL_ASSET_LONG}`);
-      eventualCachePut(cache, cacheKey, resp.clone()).catch(()=>{});
+      eventualCachePut(cache, cacheKey, makeCacheable(resp.clone(), TTL_ASSET_LONG)).catch(()=>{});
     } else {
       resp.headers.set('Cache-Control', 'private, no-store');
     }
@@ -413,7 +442,7 @@ function toProxyLocation(location, upstreamBase, upstreamHost) {
 // 页面里 ncbiBaseUrl 是硬编码的源站绝对地址，前端用它拼接搜索建议等接口。
 // 在代理域名下这些请求会变成跨域直连（被 CORS 拦截），这里在文档最前面
 // 把它改写成代理域名，使拼接出的地址仍然是同源路径。
-const BASE_URL_SHIM = `<script>(function(){try{var h=${JSON.stringify('https://' + PROXY_HOST)};` +
+const BASE_URL_SHIM = `<script>(function(){try{var h=${JSON.stringify('https://' + PROXY_HOST_ASCII)};` +
   `Object.defineProperty(window,'ncbiBaseUrl',{configurable:true,get:function(){return h;},set:function(){}});` +
   `}catch(e){}})();</script>`;
 
@@ -480,13 +509,243 @@ class StyleAttrRewriter {
   }
 }
 
+/* -------------------- 资源合并：内联 CSS / 小资源 data URI -------------------- */
+
+// 读取上游文本资源（CSS），优先命中边缘缓存
+async function fetchTextWithCache(target, accept) {
+  const cache = caches.default;
+  const cacheKey = new Request(target, { method: 'GET', headers: CACHE_KEY_HEADERS });
+  try {
+    const cached = await cache.match(cacheKey);
+    if (cached) return await cached.text();
+  } catch (e) { /* ignore */ }
+
+  const res = await fetch(target, {
+    headers: { 'User-Agent': UPSTREAM_UA, Accept: accept },
+    cf: { cacheTtl: TTL_ASSET_LONG, cacheEverything: true }
+  });
+  if (!res.ok) return null;
+
+  const text = await res.text();
+  try {
+    await cache.put(cacheKey, new Response(text, {
+      status: 200,
+      headers: {
+        'content-type': 'text/css; charset=utf-8',
+        'cache-control': `public, max-age=${TTL_ASSET_LONG}`
+      }
+    }));
+  } catch (e) { /* ignore */ }
+  return text;
+}
+
+// 把小的字体/图标读成 data URI；超限或类型不符返回 null
+async function fetchAsDataUri(absUrl, limit) {
+  try {
+    const target = absUrl.toString();
+    const cache = caches.default;
+    const cacheKey = new Request(target, { method: 'GET', headers: CACHE_KEY_HEADERS });
+
+    let res = null;
+    try { res = await cache.match(cacheKey); } catch (e) { /* ignore */ }
+    if (!res) {
+      res = await fetch(target, {
+        headers: { 'User-Agent': UPSTREAM_UA, Accept: '*/*' },
+        cf: { cacheTtl: TTL_ASSET_LONG, cacheEverything: true }
+      });
+      if (!res.ok) return null;
+    }
+
+    const type = (res.headers.get('content-type') || '').split(';')[0].trim().toLowerCase();
+    if (!/^(font\/|image\/)/.test(type)) return null;
+
+    const buf = await res.arrayBuffer();
+    if (!buf.byteLength || buf.byteLength > limit) return null;
+
+    try {
+      await cache.put(cacheKey, new Response(buf, {
+        status: 200,
+        headers: { 'content-type': type, 'cache-control': `public, max-age=${TTL_ASSET_LONG}` }
+      }));
+    } catch (e) { /* ignore */ }
+
+    return `data:${type};base64,${arrayBufferToBase64(buf)}`;
+  } catch (e) {
+    return null;
+  }
+}
+
+function arrayBufferToBase64(buf) {
+  const bytes = new Uint8Array(buf);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  }
+  return btoa(binary);
+}
+
+// 支持 async 回调的批量替换
+async function replaceAsync(input, regex, asyncFn) {
+  const matches = [];
+  input.replace(regex, (...args) => { matches.push(args); return ''; });
+  if (!matches.length) return input;
+
+  const replaced = await Promise.all(matches.map(args => asyncFn(...args)));
+  let out = '';
+  let last = 0;
+  for (let i = 0; i < matches.length; i++) {
+    const args = matches[i];
+    const full = args[0];
+    const offset = args[args.length - 2];
+    out += input.slice(last, offset) + replaced[i];
+    last = offset + full.length;
+  }
+  return out + input.slice(last);
+}
+
+// 改写 CSS 内 url(...)：小字体转 data URI（受每页额度限制），其余转成代理地址
+async function rewriteCssForProxy(css, cssUrl, budget) {
+  return await replaceAsync(css, /url\(\s*(['"]?)([^'")]+?)\1\s*\)/gi, async (full, quote, raw) => {
+    const ref = String(raw).trim();
+    if (!ref || /^(data:|#|about:|blob:|var\()/i.test(ref)) return full;
+    let abs;
+    try { abs = new URL(ref, cssUrl); } catch (e) { return full; }
+    if (!shouldProxyHost(abs.hostname)) return full;
+
+    if (INLINE_ASSET_LIMIT > 0 && budget && budget.remaining > 0) {
+      if (/\.(woff2?|ttf|otf|eot)(\?.*)?$/i.test(abs.pathname)) {
+        budget.remaining--;
+        const dataUri = await fetchAsDataUri(abs, INLINE_ASSET_LIMIT);
+        if (dataUri) return `url(${quote}${dataUri}${quote})`;
+      }
+    }
+    const proxied = makeProxyUrl(abs.href, cssUrl);
+    if (proxied === ref) return full;
+    return `url(${quote}${proxied}${quote})`;
+  });
+}
+
+// 生成可安全写入 caches.default 的响应（带 Set-Cookie/Vary 会导致 put 失败或永不命中）
+function makeCacheable(resp, ttl) {
+  const headers = new Headers(resp.headers);
+  headers.delete('set-cookie');
+  headers.delete('vary');
+  headers.delete('age');
+  headers.set('cache-control', `public, max-age=${ttl}`);
+  return new Response(resp.body, { status: resp.status, statusText: resp.statusText, headers });
+}
+
+/* -------- 文本级合并：把样式表内容并进 HTML，去掉无效预取 -------- */
+
+// 解码 HTML 实体：链接里常见的 &amp; 必须还原成 &，否则 query 参数会全部失效
+function decodeEntities(str) {
+  if (!str || str.indexOf('&') === -1) return str;
+  return str
+    .replace(/&#(\d+);/g, (mm, d) => String.fromCharCode(Number(d)))
+    .replace(/&#x([0-9a-f]+);/gi, (mm, h) => String.fromCharCode(parseInt(h, 16)))
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&apos;/g, "'")
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&');
+}
+
+// 从一个标签字符串里取属性值（并解码实体）
+function attrValue(tag, name) {
+  const re = new RegExp(`${name}\\s*=\\s*(?:"([^"]*)"|'([^']*)'|([^\\s"'>]+))`, 'i');
+  const m = re.exec(tag);
+  if (!m) return null;
+  return decodeEntities(m[1] !== undefined ? m[1] : (m[2] !== undefined ? m[2] : m[3]));
+}
+
+/**
+ * 合并样式表 / 内联图标 / 删除无用预取标签。
+ * 纯字符串替换：任何异常都原样返回原 HTML，绝不会让页面丢样式。
+ */
+async function inlineStylesheets(html, documentBase) {
+  try {
+    if (!INLINE_CSS && !INLINE_FAVICON) return html;
+
+    const tagRe = /<link\b[^>]*>/gi;
+    const tags = [];
+    let m;
+    while ((m = tagRe.exec(html)) !== null) {
+      tags.push({ start: m.index, end: m.index + m[0].length, tag: m[0] });
+    }
+    if (!tags.length) return html;
+
+    const fontBudget = { remaining: MAX_INLINE_ASSETS_PER_PAGE };
+    const iconBudget = { remaining: 2 };
+
+    const replaced = await Promise.all(tags.map(async ({ tag }) => {
+      const rel = (attrValue(tag, 'rel') || '').toLowerCase();
+
+      // 1) 清掉会产生额外请求的预取标签
+      if (/prefetch|prerender/.test(rel)) return '';
+      if (rel.includes('preload') && !rel.includes('modulepreload')) {
+        const as = (attrValue(tag, 'as') || '').toLowerCase();
+        if (as === 'style' || as === 'font' || as === 'fetch') return '';
+      }
+
+      const href = attrValue(tag, 'href');
+      if (!href) return null;
+
+      let abs;
+      try { abs = new URL(href, documentBase); } catch (e) { return null; }
+      if (!shouldProxyHost(abs.hostname)) return null;
+
+      // 2) 样式表内联
+      if (INLINE_CSS && /(^|\s)stylesheet(\s|$)/.test(rel) &&
+          !/(^|\s)alternate(\s|$)/.test(rel) && !attrValue(tag, 'title')) {
+        const cssText = await fetchTextWithCache(
+          `https://${abs.hostname}${abs.pathname}${abs.search}`,
+          'text/css,*/*;q=0.1'
+        );
+        // 上游没拿到有效 CSS 时会返回一段 ResourceLoader 说明文字，绝不能被内联进页面
+        const looksPlaceholder = !!cssText && cssText.length < 1000 && /ResourceLoader|This file is the Web entry point/.test(cssText);
+        if (cssText && !looksPlaceholder && cssText.length <= MAX_INLINE_CSS_BYTES) {
+          const css = (await rewriteCssForProxy(cssText, abs, fontBudget)).replace(/<\/style/gi, '<\\/style');
+          const media = attrValue(tag, 'media');
+          const mediaAttr = media ? ` media="${media.replace(/"/g, '&quot;')}"` : '';
+          return `<style${mediaAttr}>${css}</style>`;
+        }
+        return null; // 取不到 CSS 就保留 <link>，由 AttrRewriter 改成代理地址
+      }
+
+      // 3) 站点图标内联
+      if (INLINE_FAVICON && INLINE_ASSET_LIMIT > 0 && iconBudget.remaining > 0 &&
+          /(^|\s)(shortcut\s+icon|icon|apple-touch-icon|apple-touch-icon-precomposed|mask-icon)(\s|$)/.test(rel)) {
+        iconBudget.remaining--;
+        const dataUri = await fetchAsDataUri(abs, INLINE_ASSET_LIMIT);
+        if (dataUri) {
+          const hrefMatch = tag.match(/href\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'>]+)/i);
+          if (hrefMatch) return tag.replace(hrefMatch[0], `href="${dataUri}"`);
+        }
+      }
+      return null;
+    }));
+
+    let out = html;
+    for (let i = tags.length - 1; i >= 0; i--) {
+      const r = replaced[i];
+      if (r === null || r === undefined) continue;
+      out = out.slice(0, tags[i].start) + r + out.slice(tags[i].end);
+    }
+    return out;
+  } catch (e) {
+    return html;
+  }
+}
+
 function isAlreadyProxied(val) {
   try {
     if (!val) return false;
     if (typeof val !== 'string') return false;
     if (val.startsWith(PROXY_PREFIX)) return true;
     const u = new URL(val, `https://${DEFAULT_ORIGIN}`);
-    if (u.hostname === PROXY_HOST) return true;
+    if (u.hostname === PROXY_HOST_ASCII) return true;
     if (u.pathname && u.pathname.startsWith(PROXY_PREFIX)) return true;
     return false;
   } catch (e) {
@@ -512,8 +771,13 @@ function makeProxyUrl(orig, documentBase = `https://${DEFAULT_ORIGIN}/`) {
 
     const u = new URL(orig, documentBase);
     const host = u.hostname.toLowerCase();
+    // 主站内容用干净路径，和站点入口一致
+    if (host === DEFAULT_ORIGIN) {
+      return `https://${PROXY_HOST_ASCII}${u.pathname}${u.search || ''}${u.hash || ''}`;
+    }
+    // 其它需要代理的主机（code.jquery.com 等）走纯转发通道
     if (shouldProxyHost(host)) {
-      return `https://${PROXY_HOST}${PROXY_PREFIX}${host}${u.pathname}${u.search || ''}${u.hash || ''}`;
+      return `https://${PROXY_HOST_ASCII}${PROXY_PREFIX}${host}${u.pathname}${u.search || ''}${u.hash || ''}`;
     }
     return orig;
   } catch (e) {
@@ -597,6 +861,14 @@ function stripProblematicHeaders(origHeaders) {
     'x-frame-options'
   ].forEach(h => headers.delete(h));
   return rewriteResponseCookies(headers);
+}
+
+// body 被重新生成后，必须丢掉与旧 body 绑定的头，否则下游会按旧的编码/长度解析
+function stripBodyHeaders(origHeaders) {
+  const headers = stripProblematicHeaders(origHeaders);
+  ['content-encoding', 'content-length', 'transfer-encoding', 'content-md5', 'etag']
+    .forEach(h => headers.delete(h));
+  return headers;
 }
 
 /**
