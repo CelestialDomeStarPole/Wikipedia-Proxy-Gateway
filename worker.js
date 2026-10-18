@@ -54,9 +54,12 @@ const hostFailureMap = new Map(); // host -> timestamp of last failure
 // 多久认为 host 恢复？（秒）
 const HOST_FAILURE_TTL = 60 * 60; // 1 hour
 
-addEventListener('fetch', event => {
-  event.respondWith(mainHandler(event.request));
-});
+// ES Module 格式：rate limiting binding 需要它（Service Worker 格式会导致 workerd 启动失败）
+export default {
+  async fetch(request, env) {
+    return await mainHandler(request, env);
+  }
+};
 
 /* ========== 登录与会话验证 ========== */
 async function authenticate(request) {
@@ -133,7 +136,7 @@ async function handleLogin(request, url) {
 }
 
 /* -------------------- 主入口 -------------------- */
-async function mainHandler(request) {
+async function mainHandler(request, env) {
   try {
     const url = new URL(request.url);
 
@@ -290,7 +293,8 @@ async function handleSiteRequest(request, url) {
     method: request.method,
     headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN),
     body: request.method === 'GET' || request.method === 'HEAD' ? null : request.body,
-    redirect: 'follow'
+    // 重定向交给浏览器处理：否则地址栏停留在旧路径，页面内相对资源会全部错位
+    redirect: 'manual'
   });
 
   let fetched;
@@ -298,6 +302,17 @@ async function handleSiteRequest(request, url) {
     fetched = await fetch(forwarded, { cf: { cacheTtl: TTL_HTML, cacheEverything: true } });
   } catch (err) {
     return errorPage('Failed to fetch origin HTML: ' + (err.message || String(err)));
+  }
+
+  // 上游 3xx：改写成代理地址后返回给浏览器，保证地址栏与实际内容一致
+  if (isRedirectStatus(fetched.status)) {
+    const proxyLocation = toProxyLocation(fetched.headers.get('location'), originUrl);
+    if (proxyLocation) {
+      return new Response(null, {
+        status: fetched.status,
+        headers: { location: proxyLocation, 'cache-control': 'no-store' }
+      });
+    }
   }
 
   const contentType = (fetched.headers.get('content-type') || '').toLowerCase();
@@ -713,6 +728,23 @@ class StyleAttrRewriter {
     } catch (e) {
       // ignore
     }
+  }
+}
+
+const REDIRECT_STATUS = new Set([301, 302, 303, 307, 308]);
+
+function isRedirectStatus(status) {
+  return REDIRECT_STATUS.has(status);
+}
+
+// 把上游 Location 转成代理地址（主域走干净路径），让浏览器自己跳转
+function toProxyLocation(location, upstreamBase) {
+  if (!location) return null;
+  try {
+    const abs = new URL(location, upstreamBase);
+    return makeProxyUrl(abs.href, upstreamBase);
+  } catch (e) {
+    return null;
   }
 }
 

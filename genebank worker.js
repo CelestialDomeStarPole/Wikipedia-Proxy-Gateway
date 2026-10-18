@@ -47,9 +47,12 @@ const ALLOWED_METHODS = new Set(['GET', 'HEAD', 'POST', 'OPTIONS']);
 const hostFailureMap = new Map();
 const HOST_FAILURE_TTL = 60 * 60;
 
-addEventListener('fetch', event => {
-  event.respondWith(mainHandler(event.request));
-});
+// ES Module 格式：rate limiting binding 需要它（Service Worker 格式会导致 workerd 启动失败）
+export default {
+  async fetch(request, env) {
+    return await mainHandler(request, env);
+  }
+};
 
 async function authenticate(request) {
   const cookies = request.headers.get('Cookie') || '';
@@ -124,7 +127,7 @@ async function handleLogin(request, url) {
   });
 }
 
-async function mainHandler(request) {
+async function mainHandler(request, env) {
   try {
     const url = new URL(request.url);
 
@@ -263,7 +266,9 @@ async function handleSiteRequest(request, url) {
     method: request.method,
     headers: prepareForwardHeaders(request.headers, DEFAULT_ORIGIN, url.pathname),
     body: isIdempotent(request.method) ? null : request.body,
-    redirect: isIdempotent(request.method) ? 'follow' : 'manual'
+    // 重定向一律交给浏览器处理：否则地址栏停留在旧路径（如 /assembly），
+    // 而内容其实来自新路径（/datasets/genome/），页面内相对资源会全部错位
+    redirect: 'manual'
   });
   // 页面必须回源：只有回源才能拿到源站新下发的会话 / CSRF Cookie
   markNoCache(forwarded);
@@ -275,6 +280,20 @@ async function handleSiteRequest(request, url) {
     fetched = await fetch(forwarded);
   } catch (err) {
     return errorPage('Failed to fetch origin HTML: ' + (err.message || String(err)));
+  }
+
+  // 上游 3xx：改写成代理地址后返回，浏览器会自己跳到正确路径
+  if (isRedirectStatus(fetched.status)) {
+    const location = fetched.headers.get('location');
+    if (location) {
+      return new Response(null, {
+        status: fetched.status,
+        headers: {
+          location: toProxyLocation(location, originUrl, DEFAULT_ORIGIN),
+          'cache-control': 'no-store'
+        }
+      });
+    }
   }
 
   const contentType = (fetched.headers.get('content-type') || '').toLowerCase();
@@ -427,13 +446,11 @@ function isRedirectStatus(status) {
 }
 
 // 把源站给出的 Location 转回代理地址，避免浏览器直接跳转到源站
-function toProxyLocation(location, upstreamBase, upstreamHost) {
+function toProxyLocation(location, upstreamBase) {
   try {
     const u = new URL(location, upstreamBase);
-    if (u.hostname.toLowerCase() === upstreamHost.toLowerCase()) {
-      return makeProxyUrl(u.href, upstreamBase);
-    }
-    return u.href;
+    // 统一走 makeProxyUrl：主域 -> 干净路径，需代理的主机 -> /__proxy__/，其余原样返回
+    return makeProxyUrl(u.href, upstreamBase);
   } catch (e) {
     return location;
   }
